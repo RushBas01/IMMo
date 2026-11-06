@@ -456,6 +456,13 @@ class _TransferScreenState extends State<TransferScreen> {
     );
   }
 
+  Future<void> _safeStopNearby() async {
+    try {
+      await Nearby().stopDiscovery();
+      await Nearby().stopAdvertising();
+    } catch (_) {}
+  }
+
   /// The owner must confirm the account password and the phone's lock code before data/account leave this device.
   Future<bool> _verifyOwner() async {
     if (!await AccountStore.instance.exists()) return true;
