@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Ayach Immo - licence key issuer (PRIVATE, for the developer only).
 
-A key is a signed token (Ed25519). The app only contains the PUBLIC key, so
+After that single rebuild you NEVER rebuild the app again to issue keys: just run "gen".
+
+A key is a signed token (Ed25519), then wrapped in 7 scrambling layers (see layers() below). The app only contains the PUBLIC key, so
 nobody can forge keys even if they fully read the app. The key carries:
     target platform | duration | random id | fingerprint(user name + phone)
 
-  python3 immo_keygen.py init              create your signing key + lib/license_pubkey.dart (once!)
+  python3 immo_keygen.py init              create your signing key + lib/license_pubkey.dart (ONCE; rebuild the app once)
+  python3 immo_keygen.py sync              rewrite lib/license_pubkey.dart from the existing signing key
   python3 immo_keygen.py                   interactive menu (window if tkinter exists, else terminal)
   python3 immo_keygen.py gen --name "Ahmed" --phone +212600000000 --platform android --duration week
   python3 immo_keygen.py inspect <KEY>     decode and verify a key
@@ -14,7 +17,7 @@ Needs:  pip install cryptography
 KEEP issuer_private.pem AND ITS PASSPHRASE SECRET AND BACKED UP. If you lose it you can
 never issue keys that the published app accepts; if it leaks, anybody can.
 """
-import argparse, base64, csv, datetime, getpass, hashlib, os, re, secrets, sys
+import argparse, base64, csv, datetime, getpass, hashlib, hmac, os, re, secrets, sys
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -52,6 +55,78 @@ def group(s: str, n: int = 6) -> str:
     return "-".join(s[i:i + n] for i in range(0, len(s), n))
 
 
+# ---------------------------------------------------------------------------------------
+# 7 layers. The app holds the layer secret (derived from your signing key), so the layers
+# make the key opaque (platform / duration / user binding are hidden, no structure to guess).
+# The REAL protection against forgery is the Ed25519 signature inside; layers are on top.
+# Every layer = (1) XOR with an HMAC-SHA256 keystream, (2) keyed byte shuffle,
+# (3) chained XOR so one changed character changes everything after it.
+# lib/license_key.dart implements the exact same steps.
+# ---------------------------------------------------------------------------------------
+LAYERS = 7
+
+
+def _hm(key: bytes, msg: bytes) -> bytes:
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+
+def _stream(key: bytes, label: bytes, n: int) -> bytes:
+    out = b""
+    c = 0
+    while len(out) < n:
+        out += _hm(key, label + c.to_bytes(4, "big"))
+        c += 1
+    return out[:n]
+
+
+def _perm(key: bytes, n: int):
+    st = _stream(key, b"perm", n * 2)
+    p = list(range(n))
+    for i in range(n - 1, 0, -1):
+        r = (st[2 * i] << 8) | st[2 * i + 1]
+        j = r % (i + 1)
+        p[i], p[j] = p[j], p[i]
+    return p
+
+
+def _layer_key(secret: bytes, i: int) -> bytes:
+    return _hm(secret, b"immo-layer-%d" % i)
+
+
+def layers(data: bytes, secret: bytes, decrypt: bool = False) -> bytes:
+    n = len(data)
+    d = bytearray(data)
+    order = range(LAYERS - 1, -1, -1) if decrypt else range(LAYERS)
+    for i in order:
+        k = _layer_key(secret, i)
+        ks = _stream(k, b"ks", n)
+        perm = _perm(k, n)
+        iv = _hm(k, b"iv")[0]
+        if not decrypt:
+            d = bytearray(a ^ b for a, b in zip(d, ks))
+            d = bytearray(d[perm[j]] for j in range(n))
+            prev = iv
+            for j in range(n):
+                d[j] ^= prev
+                prev = d[j]
+        else:
+            prev = iv
+            for j in range(n):
+                cur = d[j]
+                d[j] = cur ^ prev
+                prev = cur
+            tmp = bytearray(n)
+            for j in range(n):
+                tmp[perm[j]] = d[j]
+            d = bytearray(a ^ b for a, b in zip(tmp, ks))
+    return bytes(d)
+
+
+def layer_secret(key: Ed25519PrivateKey) -> bytes:
+    seed = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+    return hashlib.sha256(b"immo-layers-v1|" + seed).digest()
+
+
 def load_private() -> Ed25519PrivateKey:
     if not os.path.exists(PRIV):
         sys.exit("No signing key yet. Run:  python3 immo_keygen.py init")
@@ -77,17 +152,26 @@ def init():
     except OSError:
         pass
     pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-    write_dart(pub)
+    write_dart(pub, layer_secret(key))
     print("Created", PRIV)
     print("Wrote  ", os.path.abspath(DART), "  <- rebuild the app with it")
     print("BACK UP issuer_private.pem NOW and never publish it.")
 
 
-def write_dart(pub: bytes):
+def sync():
+    key = load_private()
+    pub = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    write_dart(pub, layer_secret(key))
+    print("Wrote", os.path.abspath(DART), " <- rebuild the app ONCE with it")
+
+
+def write_dart(pub: bytes, secret: bytes):
     body = ", ".join(str(b) for b in pub)
     with open(DART, "w") as f:
         f.write("// Generated by tools/immo_keygen.py init. This is the PUBLIC key (safe to publish).\n")
         f.write(f"const List<int> kLicensePublicKey = [{body}];\n")
+        f.write("// Secret of the 7 scrambling layers (needed by the app to read keys; not the signing key).\n")
+        f.write(f"const List<int> kLicenseLayerSecret = [{', '.join(str(b) for b in secret)}];\n")
 
 
 def make_key(name: str, phone: str, platform: str, duration: str) -> str:
@@ -96,8 +180,9 @@ def make_key(name: str, phone: str, platform: str, duration: str) -> str:
     if not norm_name(name) or len(norm_phone(phone)) < 6:
         raise ValueError("name and a valid phone number are required")
     payload = bytes([VERSION, PLATFORMS[platform], DURATIONS[duration]]) + secrets.token_bytes(8) + fingerprint(name, phone)
-    sig = load_private().sign(MAGIC + payload)
-    key = group(b32(payload + sig))
+    pk = load_private()
+    sig = pk.sign(MAGIC + payload)
+    key = group(b32(layers(payload + sig, layer_secret(pk))))
     new = not os.path.exists(LOG)
     with open(LOG, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -110,9 +195,10 @@ def make_key(name: str, phone: str, platform: str, duration: str) -> str:
 def inspect(key: str):
     s = re.sub(r"[^A-Z2-7]", "", key.upper())
     s += "=" * (-len(s) % 8)
-    raw = base64.b32decode(s)
+    pk = load_private()
+    raw = layers(base64.b32decode(s), layer_secret(pk), decrypt=True)
     payload, sig = raw[:19], raw[19:83]
-    pub = load_private().public_key()
+    pub = pk.public_key()
     try:
         pub.verify(sig, MAGIC + payload)
         ok = True
@@ -169,6 +255,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("init")
+    sub.add_parser("sync")
     g = sub.add_parser("gen")
     g.add_argument("--name", required=True)
     g.add_argument("--phone", required=True)
@@ -179,6 +266,8 @@ def main():
     a = ap.parse_args()
     if a.cmd == "init":
         init()
+    elif a.cmd == "sync":
+        sync()
     elif a.cmd == "gen":
         print(make_key(a.name, a.phone, a.platform, a.duration))
     elif a.cmd == "inspect":
