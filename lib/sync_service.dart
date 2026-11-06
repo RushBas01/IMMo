@@ -12,7 +12,6 @@ import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import 'crypto_layers.dart';
-import 'device_lock.dart';
 import 'license.dart';
 import 'key_claims.dart';
 import 'property_model.dart';
@@ -466,6 +465,7 @@ class SyncService {
 
       final user = TextEditingController();
       final pass = TextEditingController();
+      final dev = TextEditingController();
       String? error;
       final verified = await showDialog<bool>(
         context: ctx,
@@ -481,7 +481,8 @@ class SyncService {
                   TextField(controller: user, decoration: const InputDecoration(labelText: 'اسم المستخدم')),
                   const SizedBox(height: 8),
                   TextField(controller: pass, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور')),
-                  if (error != null) Padding(padding: const EdgeInsets.only(top: 8), child: Text(error!, style: const TextStyle(color: Colors.redAccent))),
+                  const SizedBox(height: 8),
+                  TextField(controller: dev, obscureText: true, decoration: InputDecoration(labelText: 'كلمة مرور الهاتف', errorText: error)),
                 ],
               ),
             ),
@@ -492,8 +493,7 @@ class SyncService {
                   final stored = await AccountStore.instance.username();
                   final ok = stored != null &&
                       stored.toLowerCase() == user.text.trim().toLowerCase() &&
-                      await AccountStore.instance.verifyPassword(pass.text) &&
-                      await DeviceLock.confirm('أكّد برمز قفل هاتفك السماح بدخول الجهاز الجديد');
+                      await AccountStore.instance.verifyPasswords(pass.text, dev.text);
                   if (ok) {
                     if (c.mounted) Navigator.pop(c, true);
                   } else {
@@ -508,6 +508,7 @@ class SyncService {
       );
       user.dispose();
       pass.dispose();
+      dev.dispose();
 
       if (verified != true) {
         await _channel?.publish({'t': 'loginDeny', 'rid': rid, 'dev': _selfId, 'ts': _now});
@@ -525,7 +526,7 @@ class SyncService {
 /// Logging in on a new device: needs the approval of a device that is already logged in.
 class RemoteLogin {
   /// Returns null on success, otherwise an Arabic error message.
-  static Future<String?> attempt(String username, String password) async {
+  static Future<String?> attempt(String username, String password, String devicePassword) async {
     final secret = await AccountCrypto.deriveSecret(username, password);
     final rid = _randomHex(8);
     final completer = Completer<Map<String, dynamic>?>();
@@ -556,11 +557,11 @@ class RemoteLogin {
       final account = reply['account'];
       if (account is! Map<String, dynamic>) return 'ردّ غير صالح من الجهاز الآخر.';
       await AccountStore.instance.importFromTransfer(account);
-      final ok = await AccountStore.instance.login(username, password);
+      final ok = await AccountStore.instance.login(username, password, devicePassword);
       if (!ok) {
         await AccountStore.instance.delete();
         authRevision.value++;
-        return 'كلمة المرور غير صحيحة.';
+        return 'كلمة مرور الهاتف غير صحيحة.';
       }
       return null;
     } finally {

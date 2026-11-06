@@ -18,7 +18,6 @@ class Property {
   final String? audioPath;
   final List<String> videos;
   final String? sharedBy;
-  final bool isDone; // sold / rented / found
 
   Property({
     required this.id,
@@ -40,7 +39,6 @@ class Property {
     this.audioPath,
     this.videos = const [],
     this.sharedBy,
-    this.isDone = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -63,7 +61,6 @@ class Property {
         'audioPath': audioPath,
         'videos': videos,
         'sharedBy': sharedBy,
-        'isDone': isDone,
       };
 
   factory Property.fromJson(Map<String, dynamic> json, String propertyPath) {
@@ -99,7 +96,6 @@ class Property {
       audioPath: audio,
       videos: videos,
       sharedBy: json['sharedBy']?.toString(),
-      isDone: json['isDone'] == true,
     );
   }
 }

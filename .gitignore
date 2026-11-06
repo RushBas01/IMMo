@@ -47,5 +47,3 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 keys/
-tools/issuer_private.pem
-tools/issued_keys.csv

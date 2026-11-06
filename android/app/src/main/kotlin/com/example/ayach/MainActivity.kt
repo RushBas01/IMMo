@@ -1,6 +1,5 @@
 package com.example.ayach
 
-import io.flutter.embedding.android.FlutterFragmentActivity
+import io.flutter.embedding.android.FlutterActivity
 
-// local_auth (phone lock confirmation) needs a FragmentActivity.
-class MainActivity : FlutterFragmentActivity()
+class MainActivity : FlutterActivity()

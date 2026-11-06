@@ -19,12 +19,10 @@ import 'package:timezone/timezone.dart' as tz;
 
 import 'property_model.dart';
 import 'license.dart';
-import 'device_lock.dart';
-import 'stats.dart';
-import 'account_screen.dart';
 import 'auth_screens.dart';
 import 'updater.dart';
 import 'sync_service.dart';
+import 'devices_screen.dart';
 
 final FlutterLocalNotificationsPlugin flutterLocalNotificationsPlugin = FlutterLocalNotificationsPlugin();
 
@@ -157,7 +155,6 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> with Widget
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed) {
       cleanupUpdateApks();
-      UpdateManager.instance.check(context); // mandatory updates are re-checked on every return
       SyncService.instance.start().then((_) => SyncService.instance.hello());
     } else if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
       SyncService.instance.goOffline(); // the app is closed -> shown as offline
@@ -175,7 +172,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> with Widget
     HomeScreen(key: ValueKey('MyPropertiesPage'), isRequestsPage: false),
     HomeScreen(key: ValueKey('MyRequestsPage'), isRequestsPage: true),
     TransferScreen(key: ValueKey('TransferPage')),
-    AccountScreen(key: ValueKey('AccountPage')),
+    DevicesScreen(key: ValueKey('DevicesPage')),
   ];
 
   @override
@@ -198,10 +195,7 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> with Widget
         backgroundColor: const Color(0xFF121C3A),
         selectedItemColor: const Color(0xFF8FEFEF),
         unselectedItemColor: const Color(0xFF64748B),
-        onTap: (index) {
-          currentTab.value = index;
-          setState(() => _currentIndex = index);
-        },
+        onTap: (index) => setState(() => _currentIndex = index),
         items: const [
           BottomNavigationBarItem(
             icon: Icon(Icons.home_rounded),
@@ -216,8 +210,8 @@ class _MainNavigationScreenState extends State<MainNavigationScreen> with Widget
             label: 'النقل',
           ),
           BottomNavigationBarItem(
-            icon: Icon(Icons.person_rounded),
-            label: 'حسابي',
+            icon: Icon(Icons.devices_rounded),
+            label: 'الأجهزة',
           ),
         ],
       ),
@@ -456,18 +450,12 @@ class _TransferScreenState extends State<TransferScreen> {
     );
   }
 
-  Future<void> _safeStopNearby() async {
-    try {
-      await Nearby().stopDiscovery();
-      await Nearby().stopAdvertising();
-    } catch (_) {}
-  }
-
-  /// The owner must confirm the account password and the phone's lock code before data/account leave this device.
+  /// The owner must confirm password + phone password before data/account leave this device.
   Future<bool> _verifyOwner() async {
     if (!await AccountStore.instance.exists()) return true;
     if (!mounted) return false;
     final pass = TextEditingController();
+    final dev = TextEditingController();
     String? error;
     final ok = await showDialog<bool>(
       context: context,
@@ -479,17 +467,16 @@ class _TransferScreenState extends State<TransferScreen> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              TextField(controller: pass, obscureText: true, decoration: InputDecoration(labelText: 'كلمة المرور', errorText: error)),
+              TextField(controller: pass, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور')),
               const SizedBox(height: 8),
-              const Text('ثم سيُطلب منك رمز قفل هاتفك.', style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12)),
+              TextField(controller: dev, obscureText: true, decoration: InputDecoration(labelText: 'كلمة مرور الهاتف', errorText: error)),
             ],
           ),
           actions: [
             TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () async {
-                if (await AccountStore.instance.verifyPassword(pass.text) &&
-                    await DeviceLock.confirm('أكّد برمز قفل هاتفك نقل بياناتك')) {
+                if (await AccountStore.instance.verifyPasswords(pass.text, dev.text)) {
                   if (ctx.mounted) Navigator.pop(ctx, true);
                 } else {
                   setS(() => error = 'بيانات غير صحيحة');
@@ -502,6 +489,7 @@ class _TransferScreenState extends State<TransferScreen> {
       ),
     );
     pass.dispose();
+    dev.dispose();
     return ok == true;
   }
 
@@ -675,6 +663,149 @@ class _TransferScreenState extends State<TransferScreen> {
     }
   }
 
+  Future<void> _confirmDeleteAccount() async {
+    final pass = TextEditingController();
+    final dev = TextEditingController();
+    bool everywhere = false;
+    String? error;
+    bool busy = false;
+    final ok = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setS) => AlertDialog(
+          backgroundColor: const Color(0xFF121C3A),
+          title: const Text('حذف الحساب', style: TextStyle(color: Colors.redAccent)),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Text(
+                  'سيتم حذف الحساب وجميع العقارات والطلبات والصور والفيديوهات والتسجيلات من هذا الجهاز نهائيا ولا يمكن التراجع.',
+                  style: TextStyle(color: Color(0xFFCBD5E1)),
+                ),
+                const SizedBox(height: 12),
+                TextField(controller: pass, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة المرور')),
+                TextField(controller: dev, obscureText: true, decoration: const InputDecoration(labelText: 'كلمة مرور الهاتف')),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: everywhere,
+                  onChanged: (v) => setS(() => everywhere = v),
+                  title: const Text('احذفه أيضا من جميع أجهزتي', style: TextStyle(fontSize: 14)),
+                ),
+                if (error != null) Text(error!, style: const TextStyle(color: Colors.redAccent)),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: busy ? null : () => Navigator.pop(ctx, false), child: const Text('إلغاء')),
+            TextButton(
+              onPressed: busy
+                  ? null
+                  : () async {
+                      setS(() => busy = true);
+                      final good = await AccountStore.instance.verifyPasswords(pass.text, dev.text);
+                      if (!good) {
+                        setS(() {
+                          busy = false;
+                          error = 'كلمة المرور أو كلمة مرور الهاتف غير صحيحة.';
+                        });
+                        return;
+                      }
+                      await SyncService.instance.deleteAccount(everywhere: everywhere);
+                      if (ctx.mounted) Navigator.pop(ctx, true);
+                    },
+              child: const Text('حذف نهائي', style: TextStyle(color: Colors.redAccent)),
+            ),
+          ],
+        ),
+      ),
+    );
+    pass.dispose();
+    dev.dispose();
+    if (ok == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('تم حذف الحساب وجميع البيانات.')));
+    }
+  }
+
+  Future<void> _showAbout() async {
+    final lic = await LicenseStore.instance.load();
+    final username = await AccountStore.instance.username();
+    if (!mounted) return;
+    String licText;
+    switch (lic.type) {
+      case LicenseType.permanent:
+        licText = 'النسخة: دائمة';
+        break;
+      case LicenseType.trial:
+        final left = lic.trialRemaining;
+        licText = 'النسخة: تجريبية (المتبقي ${left.inHours} س ${left.inMinutes % 60} د)';
+        break;
+      default:
+        licText = '';
+    }
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF121C3A),
+        title: const Text('حول التطبيق', style: TextStyle(color: Color(0xFF8FEFEF))),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('جميع حقوق الطباعة والنشر محفوظة © SmileyRush',
+                style: TextStyle(color: Color(0xFFCBD5E1))),
+            const SizedBox(height: 12),
+            const Text('تيليجرام: @SmileyRush', style: TextStyle(color: Color(0xFF38BDF8))),
+            const SizedBox(height: 12),
+            if (licText.isNotEmpty) Text(licText, style: const TextStyle(color: Color(0xFFCBD5E1))),
+            if (username != null) Text('الحساب: $username', style: const TextStyle(color: Color(0xFFCBD5E1))),
+            Text('الإصدار: $kAppVersion', style: const TextStyle(color: Color(0xFF64748B))),
+          ],
+        ),
+        actions: [
+          if (username != null)
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _confirmDeleteAccount();
+              },
+              child: const Text('حذف الحساب', style: TextStyle(color: Colors.redAccent)),
+            ),
+          if (username != null)
+            TextButton(
+              onPressed: () async {
+                Navigator.pop(ctx);
+                await SyncService.instance.announceLogout();
+                await AccountStore.instance.logout();
+              },
+              child: const Text('تسجيل الخروج', style: TextStyle(color: Colors.redAccent)),
+            ),
+          TextButton(
+            onPressed: () async {
+              final messenger = ScaffoldMessenger.of(context);
+              final ok = await launchUrl(Uri.parse('https://t.me/SmileyRush'), mode: LaunchMode.externalApplication)
+                  .catchError((_) => false);
+              if (!ok) {
+                await Clipboard.setData(const ClipboardData(text: 'https://t.me/SmileyRush'));
+                messenger.showSnackBar(const SnackBar(content: Text('تم نسخ رابط التلجرام.')));
+              }
+            },
+            child: const Text('فتح تيليجرام'),
+          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إغلاق')),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _safeStopNearby() async {
+    try {
+      await Nearby().stopDiscovery();
+      await Nearby().stopAdvertising();
+    } catch (_) {}
+  }
+
   @override
   void dispose() {
     _safeStopNearby();
@@ -687,6 +818,13 @@ class _TransferScreenState extends State<TransferScreen> {
       appBar: AppBar(
         backgroundColor: Colors.transparent,
         elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.more_vert, color: Color(0xFF8FEFEF)),
+            onPressed: _showAbout,
+            tooltip: 'حول',
+          ),
+        ],
         title: const Text(
           'نقل البيانات (Nearby Connections)',
           style: TextStyle(
@@ -1009,41 +1147,11 @@ class _HomeScreenState extends State<HomeScreen> {
       audioPath: property.audioPath,
       videos: property.videos,
       sharedBy: property.sharedBy,
-      isDone: property.isDone,
     );
 
     final jsonFile = File('${property.path}/data.json');
     await jsonFile.writeAsString(jsonEncode(updatedProp.toJson()));
 
-    await _loadProperties();
-  }
-
-  /// Marks a property/request as sold, rented or found (and back).
-  Future<void> _toggleDone(Property property) async {
-    final updated = Property(
-      id: property.id,
-      category: property.category,
-      type: property.type,
-      city: property.city,
-      quartier: property.quartier,
-      area: property.area,
-      description: property.description,
-      price: property.price,
-      createdAt: property.createdAt,
-      images: property.images,
-      path: property.path,
-      ownerName: property.ownerName,
-      ownerPhone: property.ownerPhone,
-      clientName: property.clientName,
-      clientPhone: property.clientPhone,
-      isFavorite: property.isFavorite,
-      audioPath: property.audioPath,
-      videos: property.videos,
-      sharedBy: property.sharedBy,
-      isDone: !property.isDone,
-    );
-    await File('${property.path}/data.json').writeAsString(jsonEncode(updated.toJson()));
-    await StatsStore.instance.bump(widget.isRequestsPage ? 'done_requests' : 'done_properties', updated.isDone ? 1 : -1);
     await _loadProperties();
   }
 
@@ -1185,7 +1293,6 @@ class _HomeScreenState extends State<HomeScreen> {
       final propDir = Directory(property.path);
       if (await propDir.exists()) {
         await propDir.delete(recursive: true);
-        await StatsStore.instance.bump(widget.isRequestsPage ? 'deleted_requests' : 'deleted_properties', 1);
 
         String rootFolder = widget.isRequestsPage ? 'requests' : 'uploads';
         Directory currentDir = propDir.parent;
@@ -1379,18 +1486,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18),
-            child: Align(
-              alignment: AlignmentDirectional.centerStart,
-              child: Text(
-                widget.isRequestsPage
-                    ? 'العدد الإجمالي للطلبات: ${allProperties.length}'
-                    : 'العدد الإجمالي للعقارات: ${allProperties.length}',
-                style: const TextStyle(color: Color(0xFF94A3B8), fontSize: 13),
-              ),
-            ),
-          ),
           Expanded(
             child: isLoading
                 ? const Center(child: CircularProgressIndicator(color: Color(0xFF8FEFEF)))
@@ -1413,7 +1508,6 @@ class _HomeScreenState extends State<HomeScreen> {
                             onEdit: () => _openEditModal(item),
                             onDelete: () => _deleteProperty(item),
                             onToggleFavorite: () => _toggleFavorite(item),
-                            onToggleDone: () => _toggleDone(item),
                             onShare: widget.isRequestsPage ? null : () => _chooseShare(item),
                           );
                         },
@@ -1443,7 +1537,6 @@ class PropertyCard extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onToggleFavorite;
-  final VoidCallback onToggleDone;
   final VoidCallback? onShare;
 
   const PropertyCard({
@@ -1454,7 +1547,6 @@ class PropertyCard extends StatelessWidget {
     required this.onEdit,
     required this.onDelete,
     required this.onToggleFavorite,
-    required this.onToggleDone,
     this.onShare,
   });
 
@@ -1556,8 +1648,8 @@ class PropertyCard extends StatelessWidget {
             color: const Color(0xFF152238),
             borderRadius: BorderRadius.circular(14),
             border: Border.all(
-              color: property.isDone ? const Color(0xFF22C55E) : (property.isFavorite ? Colors.amber : const Color(0xFF4A5568)),
-              width: (property.isFavorite || property.isDone) ? 1.5 : 1.0,
+              color: property.isFavorite ? Colors.amber : const Color(0xFF4A5568),
+              width: property.isFavorite ? 1.5 : 1.0,
             ),
             boxShadow: [
               BoxShadow(
@@ -1693,17 +1785,6 @@ class PropertyCard extends StatelessWidget {
                     ),
                   IconButton(
                     icon: Icon(
-                      property.isDone ? Icons.check_circle_rounded : Icons.check_circle_outline_rounded,
-                      color: property.isDone ? const Color(0xFF22C55E) : const Color(0xFF64748B),
-                      size: 26,
-                    ),
-                    onPressed: onToggleDone,
-                    tooltip: property.isDone
-                        ? 'إلغاء التأكيد'
-                        : (isRequestsPage ? 'تم إيجاد العقار للزبون' : (property.type == 'local' ? 'تم الكراء' : 'تم البيع')),
-                  ),
-                  IconButton(
-                    icon: Icon(
                       property.isFavorite ? Icons.star_rounded : Icons.star_outline_rounded,
                       color: property.isFavorite ? Colors.amber : const Color(0xFF64748B),
                       size: 26,
@@ -1749,17 +1830,6 @@ class PropertyCard extends StatelessWidget {
           ),
         ),
 
-        if (property.isDone)
-          Positioned(
-            top: 10,
-            right: 10,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(color: const Color(0xFF22C55E), borderRadius: BorderRadius.circular(10)),
-              child: Text(isRequestsPage ? 'تم الإيجاد' : (property.type == 'local' ? 'تم الكراء' : 'تم البيع'),
-                  style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
-            ),
-          ),
         if (property.isFavorite)
           const Positioned(
             top: 10,
@@ -2298,7 +2368,6 @@ class _EditPropertyModalState extends State<EditPropertyModal> {
         audioPath: _finalAudio,
         videos: _finalVideos,
         sharedBy: widget.property.sharedBy,
-        isDone: widget.property.isDone,
       );
 
       final jsonFile = File('${widget.property.path}/data.json');

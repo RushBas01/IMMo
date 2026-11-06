@@ -9,8 +9,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'crypto_layers.dart';
 import 'key_claims.dart';
-import 'license_key.dart';
-import 'stats.dart';
+import 'key_hashes.dart';
 
 /// Version number of THIS build. Must match the N in the release file ImmoV<N>.apk.
 /// Bump it (and pubspec's build number) for every release you publish.
@@ -23,22 +22,20 @@ final ValueNotifier<int> dataRevision = ValueNotifier<int>(0);
 /// Bumped whenever the license or account changes, so the gates rebuild.
 final ValueNotifier<int> authRevision = ValueNotifier<int>(0);
 
-/// After a timed licence ends, the data is kept this long while the user pays for a permanent key.
-const Duration kGracePeriod = Duration(days: 3);
+const Duration kTrialDuration = Duration(hours: 24);
 
 String sha256Hex(String s) => sha256.convert(utf8.encode(s)).toString();
 
+bool isKeyFormatValid(String k) => RegExp(r'^[A-Za-z0-9]{40}$').hasMatch(k);
+
 /// revoked = the key is held by an older device; needsOnline = not verified online
 /// for too long (never saved to disk, only returned by evaluate()).
-enum LicenseType { none, trial, permanent, expired, revoked, needsOnline, grace }
+enum LicenseType { none, trial, permanent, expired, revoked, needsOnline }
 
 /// How long a key-activated license may run without an online check.
 const Duration kVerifyGrace = Duration(days: 7);
 /// How often an open app renews/verifies its key claim.
 const Duration kVerifyEvery = Duration(minutes: 25);
-
-/// Message shown on the activation screen after a key was rejected (e.g. name/phone mismatch).
-final ValueNotifier<String?> activationNotice = ValueNotifier<String?>(null);
 
 class LicenseState {
   LicenseType type;
@@ -51,10 +48,6 @@ class LicenseState {
   String claimSecret; // hex of the key-derived relay secret (never the key itself)
   int claimTime; // relay clock (s) of this device's claim
   int lastVerified; // ms, last successful online check
-  int durationMs; // length of a timed (trial) licence
-  String keyBind; // fingerprint (name+phone) of the key, checked when the account is created
-  String keyHash; // sha256 of the key that activated this device
-  bool bound; // true once the account matched the key's fingerprint
 
   LicenseState({
     this.type = LicenseType.none,
@@ -67,10 +60,6 @@ class LicenseState {
     this.claimSecret = '',
     this.claimTime = 0,
     this.lastVerified = 0,
-    this.durationMs = 0,
-    this.keyBind = '',
-    this.keyHash = '',
-    this.bound = true,
   }) : used = used ?? <String>{};
 
   Map<String, dynamic> toJson() => {
@@ -84,10 +73,6 @@ class LicenseState {
         'claimSecret': claimSecret,
         'claimTime': claimTime,
         'lastVerified': lastVerified,
-        'durationMs': durationMs,
-        'keyBind': keyBind,
-        'keyHash': keyHash,
-        'bound': bound,
       };
 
   factory LicenseState.fromJson(Map<String, dynamic> j) => LicenseState(
@@ -101,22 +86,11 @@ class LicenseState {
         claimSecret: j['claimSecret']?.toString() ?? '',
         claimTime: (j['claimTime'] as num?)?.toInt() ?? 0,
         lastVerified: (j['lastVerified'] as num?)?.toInt() ?? 0,
-        durationMs: (j['durationMs'] as num?)?.toInt() ?? 0,
-        keyBind: j['keyBind']?.toString() ?? '',
-        keyHash: j['keyHash']?.toString() ?? '',
-        bound: j['bound'] != false,
       );
 
-  int get endsAt => activatedAt + durationMs;
-  int get graceEndsAt => endsAt + kGracePeriod.inMilliseconds;
-
   Duration get trialRemaining {
-    final left = DateTime.fromMillisecondsSinceEpoch(endsAt).difference(DateTime.now());
-    return left.isNegative ? Duration.zero : left;
-  }
-
-  Duration get graceRemaining {
-    final left = DateTime.fromMillisecondsSinceEpoch(graceEndsAt).difference(DateTime.now());
+    final end = DateTime.fromMillisecondsSinceEpoch(activatedAt).add(kTrialDuration);
+    final left = end.difference(DateTime.now());
     return left.isNegative ? Duration.zero : left;
   }
 }
@@ -173,8 +147,7 @@ class LicenseStore {
     }
   }
 
-  /// Loads the license and applies expiry. A timed licence that ended gives a 3-day
-  /// grace period (data kept, app locked); after it the data is wiped.
+  /// Loads the license and applies trial expiry. Expiry wipes all app data.
   Future<LicenseState> evaluate() async {
     final s = await load();
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -188,24 +161,20 @@ class LicenseStore {
       authRevision.value++;
       return s;
     }
-    if (now > s.lastSeen) {
-      s.lastSeen = now;
-      await save(s);
-    }
     if (s.type == LicenseType.trial) {
-      if (s.durationMs <= 0) s.durationMs = const Duration(hours: 24).inMilliseconds; // legacy trial
-      // lastSeen never goes backwards, so turning the clock back gains nothing.
-      final effNow = max(now, s.lastSeen);
-      if (effNow >= s.graceEndsAt) {
+      final clockRolledBack = now < s.lastSeen - const Duration(minutes: 2).inMilliseconds;
+      final expired = now >= s.activatedAt + kTrialDuration.inMilliseconds;
+      if (clockRolledBack || expired) {
         await wipeAllData();
         s.type = LicenseType.expired;
         await save(s);
         authRevision.value++;
         return s;
       }
-      if (effNow >= s.endsAt) {
-        return LicenseState.fromJson({...s.toJson(), 'type': LicenseType.grace.name});
-      }
+    }
+    if (now > s.lastSeen) {
+      s.lastSeen = now;
+      await save(s);
     }
     // Key-activated licenses must be re-verified online at least every 7 days.
     if (s.claimSecret.isNotEmpty && (s.type == LicenseType.trial || s.type == LicenseType.permanent)) {
@@ -237,88 +206,55 @@ class LicenseStore {
     return true;
   }
 
-  /// Checks a key without using it. Returns (error, info); error null = usable.
-  Future<(String?, KeyInfo?)> inspectKey(String raw, {required bool permanentOnly}) async {
-    final info = await LicenseKeys.parse(raw);
-    if (info == null) return ('المفتاح غير صحيح.', null);
-    final me = LicenseKeys.currentPlatform;
-    if (info.platform != KeyPlatform.any && info.platform != me) {
-      return ('هذا المفتاح مخصص لمنصة ${LicenseKeys.platformNameAr(info.platform)} ولا يعمل على هذا الجهاز.', null);
-    }
+  /// null = key is usable. Otherwise an Arabic error message.
+  Future<String?> checkKey(String raw, {required bool permanentOnly}) async {
+    final key = raw.trim();
+    if (!isKeyFormatValid(key)) return 'المفتاح يجب أن يتكون من 40 حرفا ورقما.';
+    final h = sha256Hex(key);
     final s = await load();
-    if (s.used.contains(sha256Hex(info.canonical))) return ('هذا المفتاح مستعمل من قبل ولم يعد صالحا.', null);
-    final replacing = s.type == LicenseType.none || s.type == LicenseType.expired || s.type == LicenseType.revoked;
-    if (!info.forever && (permanentOnly || !replacing)) return ('يلزم مفتاح تأبيد (إلى الأبد) لهذه العملية.', null);
-    // With an existing account the key must have been issued for that account's name + phone.
-    final acc = await AccountStore.instance.bindHex();
-    if (acc != null && acc != info.bindHex) return ('مفتاح غير صالح.', null);
-    return (null, info);
+    if (s.used.contains(h)) return 'هذا المفتاح مستعمل من قبل ولم يعد صالحا.';
+    final isTrial = trialKeyHashes.contains(h);
+    final isPerm = permanentKeyHashes.contains(h);
+    if (!isTrial && !isPerm) return 'المفتاح غير صحيح.';
+    if (permanentOnly && !isPerm) return 'يلزم مفتاح دائم لهذه العملية.';
+    if (isTrial && s.type != LicenseType.none) return 'لا يمكن استعمال مفتاح تجريبي الآن.';
+    return null;
   }
 
-  /// null = key is usable. Otherwise an Arabic error message.
-  Future<String?> checkKey(String raw, {required bool permanentOnly}) async => (await inspectKey(raw, permanentOnly: permanentOnly)).$1;
-
-  /// Activates the app with a key. null = success.
+  /// Activates the app with a trial or permanent key. null = success.
   Future<String?> activate(String raw) async {
-    final (err, info) = await inspectKey(raw, permanentOnly: false);
-    if (err != null || info == null) return err;
-    final h = sha256Hex(info.canonical);
+    final err = await checkKey(raw, permanentOnly: false);
+    if (err != null) return err;
+    final key = raw.trim();
+    final h = sha256Hex(key);
     // Single use across devices: claim the key on the relay first.
-    final secret = KeyClaims.secretFor(info.canonical);
+    final secret = KeyClaims.secretFor(key);
     final claim = await KeyClaims.claim(secret);
     if (claim.status == ClaimStatus.conflict) return 'هذا المفتاح مستعمل على جهاز آخر ولم يعد صالحا.';
     if (claim.status == ClaimStatus.offline) return 'يلزم اتصال بالإنترنت للتحقق من المفتاح. حاول مرة أخرى.';
     final s = await load();
     final now = DateTime.now().millisecondsSinceEpoch;
-    final hasAccount = await AccountStore.instance.exists();
     s.claimSecret = KeyClaims.toHex(secret);
     s.claimTime = claim.claimTime;
     s.lastVerified = now;
     s.viaAccount = false;
     s.used.add(h);
     s.lastSeen = max(s.lastSeen, now);
-    s.keyBind = info.bindHex;
-    s.keyHash = h;
-    s.bound = hasAccount; // a new account must still match the key (checked when it is created)
-    if (info.forever) {
+    if (permanentKeyHashes.contains(h)) {
       s.type = LicenseType.permanent;
-      s.durationMs = 0;
     } else {
       s.type = LicenseType.trial;
       s.activatedAt = now;
-      s.durationMs = info.duration.inMilliseconds;
     }
     await save(s);
     authRevision.value++;
     return null;
   }
 
-  /// Called when the account is created: the name + phone must be the ones the key was
-  /// issued for. On mismatch the key is released and the activation screen returns.
-  Future<bool> verifyBind(String name, String phone) async {
-    final s = await load();
-    if (s.keyBind.isEmpty || s.bound) return true;
-    if (s.keyBind == LicenseKeys.bindFor(name, phone)) {
-      s.bound = true;
-      await save(s);
-      return true;
-    }
-    s.type = LicenseType.none;
-    s.keyBind = '';
-    s.bound = true;
-    s.claimSecret = '';
-    s.used.remove(s.keyHash); // this same device may try the key again with the right details
-    s.keyHash = '';
-    await save(s);
-    activationNotice.value = 'مفتاح غير صالح: هذا المفتاح لم يصدر للاسم ورقم الهاتف المدخلين.';
-    authRevision.value++;
-    return false;
-  }
-
   /// Update keys: claims the key on the relay before anything is downloaded.
   /// null = this device now holds the key.
   Future<String?> claimOnly(String raw) async {
-    final claim = await KeyClaims.claim(KeyClaims.secretFor(LicenseKeys.canonicalize(raw)));
+    final claim = await KeyClaims.claim(KeyClaims.secretFor(raw.trim()));
     if (claim.status == ClaimStatus.conflict) return 'هذا المفتاح مستعمل على جهاز آخر ولم يعد صالحا.';
     if (claim.status == ClaimStatus.offline) return 'يلزم اتصال بالإنترنت للتحقق من المفتاح.';
     return null;
@@ -327,7 +263,7 @@ class LicenseStore {
   /// Marks a permanent key as consumed (used for paid updates).
   Future<void> consumeKey(String raw) async {
     final s = await load();
-    s.used.add(sha256Hex(LicenseKeys.canonicalize(raw)));
+    s.used.add(sha256Hex(raw.trim()));
     await save(s);
   }
 
@@ -342,13 +278,12 @@ class LicenseStore {
     authRevision.value++;
   }
 
-  Future<void> activateTrialViaAccount(int activatedAt, int durationMs) async {
+  Future<void> activateTrialViaAccount(int activatedAt) async {
     final s = await load();
     if (s.type != LicenseType.none || activatedAt <= 0) return;
     s.type = LicenseType.trial;
     s.viaAccount = true;
     s.activatedAt = activatedAt;
-    s.durationMs = durationMs;
     s.lastSeen = max(s.lastSeen, DateTime.now().millisecondsSinceEpoch);
     await save(s);
     authRevision.value++;
@@ -373,7 +308,6 @@ class LicenseStore {
         if (await d.exists()) await d.delete(recursive: true);
       }
       await AccountStore.instance.delete();
-      await StatsStore.instance.clear();
     } catch (e) {
       debugPrint('wipeAllData: $e');
     }
@@ -444,53 +378,33 @@ class AccountStore {
 
   Future<bool> isLoggedIn() async => (await _read())?['loggedIn'] == true;
 
-  /// "name#code": the name may repeat between users, the code never does.
-  Future<String> displayName() async => (await username() ?? '').split('#').first;
-  Future<String> userCode() async {
-    final u = await username() ?? '';
-    return u.contains('#') ? u.split('#').last : '';
-  }
-
-  Future<String> phone() async => (await _read())?['phone']?.toString() ?? '';
-
-  /// Fingerprint of (name + phone), compared with the one inside the licence key.
-  Future<String?> bindHex() async {
-    final a = await _read();
-    if (a == null) return null;
-    final name = (a['username']?.toString() ?? '').split('#').first;
-    return LicenseKeys.bindFor(name, a['phone']?.toString() ?? '');
-  }
-
-  Future<int> createdAt() async => ((await _read())?['createdAt'] as num?)?.toInt() ?? 0;
-
-  Future<void> create(String username, String phone, String password) async {
-    final salt = _randomBytes(16);
+  Future<void> create(String username, String password, String devicePassword) async {
+    final salt = _randomBytes(16), dsalt = _randomBytes(16);
     final secret = await AccountCrypto.deriveSecret(username, password);
-    final now = DateTime.now().millisecondsSinceEpoch;
     await _write({
       'secret': base64Encode(secret),
-      'loginAt': now,
-      'createdAt': now,
+      'loginAt': DateTime.now().millisecondsSinceEpoch,
       'username': username.trim(),
-      'phone': phone.trim(),
       'salt': base64Encode(salt),
       'hash': base64Encode(_pbkdf2(password, salt)),
+      'dsalt': base64Encode(dsalt),
+      'dhash': base64Encode(_pbkdf2(devicePassword, dsalt)),
       'loggedIn': true,
     });
     authRevision.value++;
   }
 
-  Future<bool> verifyPassword(String password) async {
+  Future<bool> verifyPasswords(String password, String devicePassword) async {
     final a = await _read();
     if (a == null) return false;
-    return _check(password, a['salt'], a['hash']);
+    return _check(password, a['salt'], a['hash']) && _check(devicePassword, a['dsalt'], a['dhash']);
   }
 
-  Future<bool> login(String username, String password) async {
+  Future<bool> login(String username, String password, String devicePassword) async {
     final a = await _read();
     if (a == null) return false;
     if (a['username'].toString().toLowerCase() != username.trim().toLowerCase()) return false;
-    if (!await verifyPassword(password)) return false;
+    if (!await verifyPasswords(password, devicePassword)) return false;
     a['loggedIn'] = true;
     a['loginAt'] = DateTime.now().millisecondsSinceEpoch;
     a['secret'] ??= base64Encode(await AccountCrypto.deriveSecret(username, password));
@@ -520,39 +434,31 @@ class AccountStore {
     if (a == null) return null;
     return {
       'username': a['username'],
-      'phone': a['phone'],
-      'createdAt': a['createdAt'],
       'salt': a['salt'],
       'hash': a['hash'],
+      'dsalt': a['dsalt'],
+      'dhash': a['dhash'],
       'permanent': lic.type == LicenseType.permanent,
       'trial': lic.type == LicenseType.trial,
       'activatedAt': lic.activatedAt,
-      'durationMs': lic.durationMs,
     };
   }
 
   Future<void> importFromTransfer(Map<String, dynamic> m) async {
-    if (m['username'] == null || m['salt'] == null || m['hash'] == null) return;
+    if (m['username'] == null || m['salt'] == null || m['hash'] == null || m['dsalt'] == null || m['dhash'] == null) return;
     await _write({
       'username': m['username'],
-      'phone': m['phone'] ?? '',
-      'createdAt': m['createdAt'] ?? DateTime.now().millisecondsSinceEpoch,
       'salt': m['salt'],
       'hash': m['hash'],
+      'dsalt': m['dsalt'],
+      'dhash': m['dhash'],
       'loggedIn': false, // the owner must log in on this device
     });
-    // A key that was not yet tied to an account cannot be tied to someone else's account.
-    final name = m['username'].toString().split('#').first;
-    if (!await LicenseStore.instance.verifyBind(name, (m['phone'] ?? '').toString())) {
-      await delete();
-      return;
-    }
     if (m['permanent'] == true) {
       await LicenseStore.instance.activatePermanentViaAccount();
     } else if (m['trial'] == true) {
       // Same trial, same end time: a second device cannot extend it.
-      await LicenseStore.instance.activateTrialViaAccount(
-          (m['activatedAt'] as num?)?.toInt() ?? 0, (m['durationMs'] as num?)?.toInt() ?? 0);
+      await LicenseStore.instance.activateTrialViaAccount((m['activatedAt'] as num?)?.toInt() ?? 0);
     }
     authRevision.value++;
   }

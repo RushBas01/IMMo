@@ -3,11 +3,8 @@ import 'dart:math';
 
 import 'package:flutter/material.dart';
 
-import 'device_lock.dart';
 import 'license.dart';
-import 'license_key.dart';
 import 'sync_service.dart';
-import 'uninstall.dart';
 
 const Color _accent = Color(0xFF8FEFEF);
 const Color _fieldFill = Color(0xFF152238);
@@ -59,7 +56,6 @@ class _LicenseGateState extends State<LicenseGate> with WidgetsBindingObserver {
   }
 
   DateTime _lastVerify = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _uninstallAsked = false;
 
   Future<void> _reload() async {
     final s = await LicenseStore.instance.evaluate();
@@ -83,14 +79,7 @@ class _LicenseGateState extends State<LicenseGate> with WidgetsBindingObserver {
       case LicenseType.trial:
       case LicenseType.permanent:
         return widget.child;
-      case LicenseType.grace:
-        return ActivationScreen(mode: ActivationMode.grace, graceEnd: s.graceEndsAt);
       case LicenseType.expired:
-        if (!_uninstallAsked) {
-          _uninstallAsked = true;
-          // The 3 days passed without payment: data is already wiped, now remove the app.
-          WidgetsBinding.instance.addPostFrameCallback((_) => SelfUninstall.request());
-        }
         return const ActivationScreen(mode: ActivationMode.expired);
       case LicenseType.revoked:
         return const ActivationScreen(mode: ActivationMode.revoked);
@@ -102,12 +91,11 @@ class _LicenseGateState extends State<LicenseGate> with WidgetsBindingObserver {
   }
 }
 
-enum ActivationMode { fresh, expired, revoked, grace }
+enum ActivationMode { fresh, expired, revoked }
 
 class ActivationScreen extends StatefulWidget {
   final ActivationMode mode;
-  final int graceEnd; // ms, only for the grace mode
-  const ActivationScreen({super.key, required this.mode, this.graceEnd = 0});
+  const ActivationScreen({super.key, required this.mode});
 
   @override
   State<ActivationScreen> createState() => _ActivationScreenState();
@@ -120,30 +108,8 @@ class _ActivationScreenState extends State<ActivationScreen> {
 
   @override
   void dispose() {
-    activationNotice.removeListener(_notice);
     _key.dispose();
     super.dispose();
-  }
-
-  @override
-  void initState() {
-    super.initState();
-    _notice();
-    activationNotice.addListener(_notice);
-  }
-
-  void _notice() {
-    final n = activationNotice.value;
-    if (n != null && mounted) {
-      setState(() => _error = n);
-      activationNotice.value = null;
-    }
-  }
-
-  String _graceLeft() {
-    final left = DateTime.fromMillisecondsSinceEpoch(widget.graceEnd).difference(DateTime.now());
-    if (left.isNegative) return 'أقل من دقيقة';
-    return '${left.inDays} يوم ${left.inHours % 24} ساعة ${left.inMinutes % 60} دقيقة';
   }
 
   Future<void> _activate() async {
@@ -170,33 +136,28 @@ class _ActivationScreenState extends State<ActivationScreen> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(widget.mode == ActivationMode.fresh ? Icons.vpn_key_rounded : (widget.mode == ActivationMode.revoked ? Icons.block : Icons.lock_clock), size: 72, color: widget.mode == ActivationMode.grace ? const Color(0xFFF59E0B) : _accent),
+                Icon(widget.mode == ActivationMode.fresh ? Icons.vpn_key_rounded : (widget.mode == ActivationMode.revoked ? Icons.block : Icons.lock_clock), size: 72, color: _accent),
                 const SizedBox(height: 16),
                 Text(
                   widget.mode == ActivationMode.expired
-                      ? 'انتهت المهلة وحُذف الحساب'
-                      : widget.mode == ActivationMode.grace
-                          ? 'انتهت مدة الترخيص'
-                          : (widget.mode == ActivationMode.revoked ? 'المفتاح مستعمل على جهاز آخر' : 'تفعيل التطبيق'),
+                      ? 'انتهت الفترة التجريبية'
+                      : (widget.mode == ActivationMode.revoked ? 'المفتاح مستعمل على جهاز آخر' : 'تفعيل التطبيق'),
                   style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: _accent),
                 ),
                 const SizedBox(height: 12),
                 Text(
                   widget.mode == ActivationMode.expired
-                      ? 'لم يُسدَّد المبلغ خلال 3 أيام فحُذف الحساب وبياناته. يمكنك شراء مفتاح جديد وإدخاله للبدء من جديد.'
-                      : widget.mode == ActivationMode.grace
-                          ? 'يلزم مفتاح التأبيد (إلى الأبد). بياناتك محفوظة ولم تُحذف: لديك مهلة ${_graceLeft()} لسداد المبلغ وإدخال المفتاح، وإلا سيُحذف الحساب وبياناته ويُلغى تثبيت التطبيق.'
+                      ? 'تم حذف بياناتك بعد انتهاء التجربة. يرجى شراء النسخة المصرح بها الدائمة ثم إدخال المفتاح الدائم.'
                       : (widget.mode == ActivationMode.revoked
                           ? 'مفتاح هذا الجهاز فعّله جهاز آخر قبله، لذلك أُوقف هنا. لتتابع أدخل مفتاحا جديدا (بياناتك لم تُحذف).'
-                          : 'الصق مفتاح التفعيل الذي أرسله لك المطور للمتابعة.'),
+                          : 'أدخل مفتاح التفعيل (40 حرفا ورقما) للمتابعة.'),
                   style: const TextStyle(color: Color(0xFFCBD5E1), fontSize: 15),
                   textAlign: TextAlign.center,
                 ),
                 const SizedBox(height: 24),
                 TextField(
                   controller: _key,
-                  minLines: 2,
-                  maxLines: 4,
+                  maxLength: 40,
                   autocorrect: false,
                   enableSuggestions: false,
                   textDirection: TextDirection.ltr,
@@ -214,16 +175,10 @@ class _ActivationScreenState extends State<ActivationScreen> {
                   ),
                 ),
                 const SizedBox(height: 8),
-                if (widget.mode == ActivationMode.fresh || widget.mode == ActivationMode.revoked)
-                  TextButton(
-                    onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const RemoteLoginScreen())),
-                    child: const Text('لدي حساب بالفعل (تسجيل الدخول بموافقة جهازي الآخر)', textAlign: TextAlign.center),
-                  ),
-                if (widget.mode == ActivationMode.expired)
-                  TextButton(
-                    onPressed: SelfUninstall.request,
-                    child: const Text('إلغاء تثبيت التطبيق', style: TextStyle(color: Colors.redAccent)),
-                  ),
+                TextButton(
+                  onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const RemoteLoginScreen())),
+                  child: const Text('لدي حساب بالفعل (تسجيل الدخول بموافقة جهازي الآخر)', textAlign: TextAlign.center),
+                ),
               ],
             ),
           ),
@@ -345,69 +300,41 @@ class CreateAccountScreen extends StatefulWidget {
 class _CreateAccountScreenState extends State<CreateAccountScreen> {
   final _form = GlobalKey<FormState>();
   final _user = TextEditingController();
-  final _phone = TextEditingController();
   final _pass = TextEditingController();
   final _pass2 = TextEditingController();
+  final _dev = TextEditingController();
+  final _dev2 = TextEditingController();
   bool _busy = false;
-  String _keyNote = '';
-
-  @override
-  void initState() {
-    super.initState();
-    LicenseStore.instance.load().then((l) {
-      if (!mounted) return;
-      setState(() {
-        _keyNote = l.type == LicenseType.permanent
-            ? 'المفتاح صحيح ✓ (دائم). أدخل نفس الاسم ورقم الهاتف اللذين صدر لهما المفتاح.'
-            : 'المفتاح صحيح ✓ (مؤقت). أدخل نفس الاسم ورقم الهاتف اللذين صدر لهما المفتاح.';
-      });
-    });
-  }
 
   @override
   void dispose() {
-    for (final c in [_user, _phone, _pass, _pass2]) {
+    for (final c in [_user, _pass, _pass2, _dev, _dev2]) {
       c.dispose();
     }
     super.dispose();
   }
 
-  /// Unique user code made by the app (the person cannot choose it).
-  static String _makeCode() {
-    const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-    final rnd = Random.secure();
-    return List.generate(6, (_) => chars[rnd.nextInt(chars.length)]).join();
-  }
-
   Future<void> _create() async {
     if (!_form.currentState!.validate()) return;
-    setState(() => _busy = true);
-    final name = _user.text.trim();
-    // The licence key was issued for one name + phone: check it now.
-    final ok = await LicenseStore.instance.verifyBind(name, _phone.text);
-    if (!ok) {
-      // verifyBind already reset the key and returns to the activation screen.
-      if (mounted) setState(() => _busy = false);
-      return;
-    }
-    final handle = '$name#${_makeCode()}';
-    final code = handle.split('#').last;
-    if (!mounted) return;
+    // Every account gets a unique handle: chosen name + random code (like Discord).
+    const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+    final rnd = Random.secure();
+    final tag = List.generate(4, (_) => chars[rnd.nextInt(chars.length)]).join();
+    final handle = '${_user.text.trim()}#$tag';
+
     await showDialog(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF121C3A),
-        title: const Text('رمز المستخدم الخاص بك', style: TextStyle(color: _accent)),
+        title: const Text('اسم المستخدم الخاص بك', style: TextStyle(color: _accent)),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            SelectableText(code, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 26, fontWeight: FontWeight.bold, letterSpacing: 3)),
-            const SizedBox(height: 8),
-            SelectableText('اسم الدخول الكامل: $handle', textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 14)),
+            SelectableText(handle, textDirection: TextDirection.ltr, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
             const SizedBox(height: 12),
             const Text(
-              'الرمز أنشأه التطبيق ولا يشاركه فيه أي حساب آخر. احفظ اسم الدخول الكامل: تحتاجه لتسجيل الدخول، ويستعمله الآخرون لمشاركة العقارات معك.',
+              'هذا الاسم فريد ولا يشاركه فيه أي حساب آخر. احفظه: تحتاجه لتسجيل الدخول، ويستعمله الآخرون لمشاركة العقارات معك.',
               style: TextStyle(color: Color(0xFFCBD5E1)),
             ),
           ],
@@ -415,7 +342,9 @@ class _CreateAccountScreenState extends State<CreateAccountScreen> {
         actions: [ElevatedButton(onPressed: () => Navigator.pop(ctx), child: const Text('متابعة'))],
       ),
     );
-    await AccountStore.instance.create(handle, _phone.text.trim(), _pass.text);
+    if (!mounted) return;
+    setState(() => _busy = true);
+    await AccountStore.instance.create(handle, _pass.text, _dev.text);
     if (mounted) setState(() => _busy = false);
   }
 
@@ -433,25 +362,13 @@ class _CreateAccountScreenState extends State<CreateAccountScreen> {
                   const Icon(Icons.person_add_alt_1_rounded, size: 64, color: _accent),
                   const SizedBox(height: 12),
                   const Text('إنشاء حساب جديد', style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold, color: _accent)),
-                  if (_keyNote.isNotEmpty) ...[
-                    const SizedBox(height: 8),
-                    Text(_keyNote, style: const TextStyle(color: Color(0xFF86EFAC), fontSize: 14), textAlign: TextAlign.center),
-                  ],
                   const SizedBox(height: 20),
                   TextFormField(
                     controller: _user,
-                    decoration: _dec('اسم المستخدم (يمكن أن يتكرر بين الناس)'),
-                    validator: (v) => RegExp(r'^[A-Za-z0-9_ \u0600-\u06FF]{2,30}$').hasMatch((v ?? '').trim())
+                    decoration: _dec('اسم المستخدم (يُضاف إليه رمز فريد تلقائيا)'),
+                    validator: (v) => RegExp(r'^[A-Za-z0-9_\u0600-\u06FF]{3,20}$').hasMatch((v ?? '').trim())
                         ? null
-                        : 'من 2 إلى 30 حرفا أو رقما (بدون #)',
-                  ),
-                  const SizedBox(height: 12),
-                  TextFormField(
-                    controller: _phone,
-                    keyboardType: TextInputType.phone,
-                    textDirection: TextDirection.ltr,
-                    decoration: _dec('رقم الهاتف (نفس الرقم الذي صدر له المفتاح)'),
-                    validator: (v) => LicenseKeys.normPhone(v ?? '').length < 8 ? 'رقم هاتف غير صحيح' : null,
+                        : 'من 3 إلى 20 حرفا أو رقما (بدون مسافات أو #)',
                   ),
                   const SizedBox(height: 12),
                   TextFormField(
@@ -467,13 +384,21 @@ class _CreateAccountScreenState extends State<CreateAccountScreen> {
                     decoration: _dec('تأكيد كلمة المرور'),
                     validator: (v) => v != _pass.text ? 'كلمتا المرور غير متطابقتين' : null,
                   ),
-                  const SizedBox(height: 8),
-                  const Text(
-                    'سيُطلب منك رمز قفل هاتفك (PIN أو النمط أو البصمة) عند العمليات الحساسة مثل تسجيل الدخول من جهاز آخر.',
-                    style: TextStyle(color: Color(0xFF94A3B8), fontSize: 12),
-                    textAlign: TextAlign.center,
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _dev,
+                    obscureText: true,
+                    decoration: _dec('كلمة مرور الهاتف'),
+                    validator: (v) => (v ?? '').length < 4 ? 'أربع خانات على الأقل' : null,
                   ),
-                  const SizedBox(height: 16),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: _dev2,
+                    obscureText: true,
+                    decoration: _dec('تأكيد كلمة مرور الهاتف'),
+                    validator: (v) => v != _dev.text ? 'غير متطابقة' : null,
+                  ),
+                  const SizedBox(height: 20),
                   SizedBox(
                     width: double.infinity,
                     child: ElevatedButton(
@@ -507,12 +432,13 @@ class LoginScreen extends StatefulWidget {
 class _LoginScreenState extends State<LoginScreen> {
   final _user = TextEditingController();
   final _pass = TextEditingController();
+  final _dev = TextEditingController();
   String? _error;
   bool _busy = false;
 
   @override
   void dispose() {
-    for (final c in [_user, _pass]) {
+    for (final c in [_user, _pass, _dev]) {
       c.dispose();
     }
     super.dispose();
@@ -523,7 +449,7 @@ class _LoginScreenState extends State<LoginScreen> {
       _busy = true;
       _error = null;
     });
-    final ok = (await DeviceLock.confirm('أكّد هويتك برمز قفل هاتفك')) && await AccountStore.instance.login(_user.text, _pass.text);
+    final ok = await AccountStore.instance.login(_user.text, _pass.text, _dev.text);
     if (mounted) {
       setState(() {
         _busy = false;
@@ -547,7 +473,9 @@ class _LoginScreenState extends State<LoginScreen> {
                 const SizedBox(height: 20),
                 TextField(controller: _user, textDirection: TextDirection.ltr, decoration: _dec('اسم المستخدم كاملا (مثال: ahmed#a7k2)')),
                 const SizedBox(height: 12),
-                TextField(controller: _pass, obscureText: true, decoration: _dec('كلمة المرور', error: _error)),
+                TextField(controller: _pass, obscureText: true, decoration: _dec('كلمة المرور')),
+                const SizedBox(height: 12),
+                TextField(controller: _dev, obscureText: true, decoration: _dec('كلمة مرور الهاتف', error: _error)),
                 const SizedBox(height: 20),
                 SizedBox(
                   width: double.infinity,
@@ -579,19 +507,20 @@ class RemoteLoginScreen extends StatefulWidget {
 class _RemoteLoginScreenState extends State<RemoteLoginScreen> {
   final _user = TextEditingController();
   final _pass = TextEditingController();
+  final _dev = TextEditingController();
   String? _error;
   bool _busy = false;
 
   @override
   void dispose() {
-    for (final c in [_user, _pass]) {
+    for (final c in [_user, _pass, _dev]) {
       c.dispose();
     }
     super.dispose();
   }
 
   Future<void> _go() async {
-    if (_user.text.trim().isEmpty || _pass.text.isEmpty) {
+    if (_user.text.trim().isEmpty || _pass.text.isEmpty || _dev.text.isEmpty) {
       setState(() => _error = 'أدخل كل البيانات.');
       return;
     }
@@ -599,16 +528,7 @@ class _RemoteLoginScreenState extends State<RemoteLoginScreen> {
       _busy = true;
       _error = null;
     });
-    if (!await DeviceLock.confirm('أكّد هويتك برمز قفل هاتفك لتسجيل الدخول')) {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-          _error = 'لم يتم تأكيد رمز قفل الهاتف.';
-        });
-      }
-      return;
-    }
-    final err = await RemoteLogin.attempt(_user.text, _pass.text);
+    final err = await RemoteLogin.attempt(_user.text, _pass.text, _dev.text);
     if (!mounted) return;
     setState(() {
       _busy = false;
@@ -641,6 +561,7 @@ class _RemoteLoginScreenState extends State<RemoteLoginScreen> {
                 const SizedBox(height: 12),
                 TextField(controller: _pass, enabled: !_busy, obscureText: true, decoration: _dec('كلمة المرور')),
                 const SizedBox(height: 12),
+                TextField(controller: _dev, enabled: !_busy, obscureText: true, decoration: _dec('كلمة مرور الهاتف', error: _error)),
                 const SizedBox(height: 20),
                 SizedBox(
                   width: double.infinity,
